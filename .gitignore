@@ -1,0 +1,11 @@
+.env
+*.env
+__pycache__/
+.venv/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+.idea/
+.vscode/
+adk-agent-key.json
