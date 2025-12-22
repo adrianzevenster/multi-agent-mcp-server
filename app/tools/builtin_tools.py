@@ -13,8 +13,6 @@ def echo(text: str) -> Dict[str, Any]:
 
 
 def list_tools() -> Dict[str, Any]:
-    # Simple placeholder; the real listing is provided by /mcp/tools endpoint.
-    # This gives the LLM a "tool" name it can call that won't error.
     return {
         "tools_hint": "Use GET /mcp/tools to view tools (UI button). Builtins available: ping, add, echo, list_capabilities."
     }

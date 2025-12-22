@@ -214,7 +214,6 @@ class ToolCallingAgent:
 
                 last_results_block = results_block
 
-                # IMPORTANT: do NOT show TOOLS again after results (reduces repeated tool calls)
                 prompt = self._build_prompt(
                     include_tools=False,
                     tools_desc=tools_desc,
@@ -226,7 +225,7 @@ class ToolCallingAgent:
 
 
 
-            # unknown => fallback
+ 
             out = raw.strip()
             self.db.log_event(
                 "final_unknown_type",
@@ -246,7 +245,7 @@ class ToolCallingAgent:
         if not text:
             return None
 
-        # Extract first {...} if wrapped in prose
+  
         if not text.startswith("{"):
             start = text.find("{")
             end = text.rfind("}")
@@ -269,7 +268,7 @@ class ToolCallingAgent:
           - a python-ish string "{'ts': '...'}" (annoying)
         Normalize to a clean user-facing string.
         """
-        # If the model already gave a dict/list, render nicely.
+
         if isinstance(out_raw, dict):
             if "ts" in out_raw:
                 return str(out_raw["ts"])
@@ -278,12 +277,11 @@ class ToolCallingAgent:
         if isinstance(out_raw, list):
             return json.dumps(out_raw, ensure_ascii=False)
 
-        # Otherwise it's probably a string
+
         s = str(out_raw).strip()
         if not s:
             return ToolCallingAgent._force_finalize_from_last_tool(tool_calls)
 
-        # Try JSON decode if it looks like JSON
         if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
             try:
                 obj = json.loads(s)
@@ -293,10 +291,8 @@ class ToolCallingAgent:
             except Exception:
                 pass
 
-        # Try to salvage python-dict-ish strings by extracting ts
-        # e.g. "{'ts': '2025-...'}"
-        if "ts" in s and "{" in s and "}" in s:
-            # super small heuristic: fall back to tool result if available
+  
+        if "ts" in s and "{" in s and "}" in s
             forced = ToolCallingAgent._force_finalize_from_last_tool(tool_calls)
             if forced and forced != "I couldn't complete the request.":
                 return forced
