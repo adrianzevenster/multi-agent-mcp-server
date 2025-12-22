@@ -8,5 +8,5 @@ from typing import Any, Callable, Dict
 class Tool:
     name: str
     description: str
-    schema: Dict[str, Any]   # JSON schema for args
+    schema: Dict[str, Any]
     fn: Callable[..., Any]
