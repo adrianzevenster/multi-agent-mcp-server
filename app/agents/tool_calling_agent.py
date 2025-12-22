@@ -224,6 +224,8 @@ class ToolCallingAgent:
                 continue
 
 
+
+ 
             out = raw.strip()
             self.db.log_event(
                 "final_unknown_type",
@@ -243,6 +245,7 @@ class ToolCallingAgent:
         if not text:
             return None
 
+  
         if not text.startswith("{"):
             start = text.find("{")
             end = text.rfind("}")
@@ -265,6 +268,7 @@ class ToolCallingAgent:
           - a python-ish string "{'ts': '...'}" (annoying)
         Normalize to a clean user-facing string.
         """
+
         if isinstance(out_raw, dict):
             if "ts" in out_raw:
                 return str(out_raw["ts"])
@@ -272,6 +276,7 @@ class ToolCallingAgent:
 
         if isinstance(out_raw, list):
             return json.dumps(out_raw, ensure_ascii=False)
+
 
         s = str(out_raw).strip()
         if not s:
@@ -286,8 +291,8 @@ class ToolCallingAgent:
             except Exception:
                 pass
 
-        if "ts" in s and "{" in s and "}" in s:
-            # super small heuristic: fall back to tool result if available
+  
+        if "ts" in s and "{" in s and "}" in s
             forced = ToolCallingAgent._force_finalize_from_last_tool(tool_calls)
             if forced and forced != "I couldn't complete the request.":
                 return forced
