@@ -25,4 +25,22 @@ class Settings:
 
     max_tool_steps: int = int(os.getenv("MAX_TOOL_STEPS", "6"))
 
+    # RAG
+    QDRANT_URL = os.getenv("QDRANT_URL", "http://qdrant:6333")
+    QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "monc_rag")
+
+    EMBED_MODEL = os.getenv(
+        "EMBED_MODEL",
+        "sentence-transformers/all-mpnet-base-v2"
+    )
+    EMBED_DIM = int(os.getenv("EMBED_DIM", "768"))
+    EMBED_CACHE_PATH = os.getenv(
+        "EMBED_CACHE_PATH",
+        "./embed_cache.sqlite"
+    )
+
+    RAG_TOP_K = int(os.getenv("RAG_TOP_K", "8"))
+    RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.25"))
+
+
 settings = Settings()
