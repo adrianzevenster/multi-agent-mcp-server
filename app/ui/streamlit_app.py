@@ -18,13 +18,10 @@ agent_name = st.selectbox("Agent", AGENTS, index=0)
 if "run_id" not in st.session_state:
     st.session_state.run_id = None
 
-# ----------------------------
-# UI: per-agent parameter form
-# ----------------------------
 def build_message_from_params(agent: str, params: dict) -> str:
     """
     Keep backend compatibility by encoding params into a structured message.
-    Your agent prompts already handle key:value style inputs well.
+    The agent prompts already handle key:value style inputs well.
     """
     lines = []
     for k, v in params.items():
@@ -40,7 +37,6 @@ def render_output(output):
     """
     Prefer human-friendly text, but keep raw JSON available.
     """
-    # If output is already a string, render it as markdown-ish text.
     if isinstance(output, str):
         text = output.strip()
         if not text:
@@ -49,9 +45,7 @@ def render_output(output):
         st.markdown(text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\n\n"))
         return
 
-    # If output is a dict/list, try to find a “main text” field.
     if isinstance(output, dict):
-        # common keys you might return from your API layer
         for key in ["text", "ad_copy", "advice", "output", "answer", "message"]:
             val = output.get(key)
             if isinstance(val, str) and val.strip():
@@ -60,7 +54,6 @@ def render_output(output):
                     st.json(output)
                 return
 
-        # If no good text field, just show JSON
         st.json(output)
         return
 
@@ -70,7 +63,6 @@ def render_output(output):
 
     st.write(output)
 
-# Build parameters UI
 params = {}
 
 if agent_name == "fastfinance_ads":
@@ -97,10 +89,8 @@ elif agent_name == "school_of_hard_knocks":
     msg = build_message_from_params(agent_name, params)
 
 else:
-    # default fallback: raw message
     msg = st.text_input("Message", value="Summarize tools and then call ping.")
 
-# Show exactly what will be sent (so the UI “includes parameters” clearly)
 with st.expander("Request payload preview"):
     preview_payload = {"message": msg, "run_id": st.session_state.run_id, "agent_name": agent_name}
     st.json(preview_payload)
