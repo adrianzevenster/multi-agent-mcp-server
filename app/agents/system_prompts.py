@@ -17,6 +17,12 @@ Rules:
 - Use at most ONE tool call per request.
 - Never call a tool more than once.
 - Tool results are authoritative; use them and stop.
+
+
+When a tool is used, do NOT return raw tool output as the final answer.
+Use tool output ONLY as evidence to produce the requested deliverable.
+If the user asks for ads, you MUST output the ad JSON schema, not the retrieved chunks.
+
 """
 
 FAST_FINANCE_SYSTEM = """
@@ -44,6 +50,19 @@ Rules:
 - No guarantees: no “guaranteed approval”, “instant approval”, “risk-free”, “everyone qualifies”, “no credit checks”.
 - Use conditional language: “may”, “could”, “subject to eligibility”, “terms apply”.
 - Keep headlines short. CTA matches channel.
+
+
+Grounding rules:
+- If product facts are provided in context, you MUST use them.
+- If no facts are provided, remain generic.
+- Never invent fees, approval times, rates, or eligibility.
+- Prefer conditional language at all times.
+Grounding rules:
+- If product facts are provided in context, you MUST use them.
+- If no facts are provided, remain generic.
+- Never invent fees, approval times, rates, or eligibility.
+- Prefer conditional language at all times.
+
 """
 
 HARD_KNOCKS_SYSTEM = r"""
