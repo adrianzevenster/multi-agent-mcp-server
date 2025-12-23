@@ -12,3 +12,19 @@ class ChatResponse(BaseModel):
     agent_name: str
     output: str
     tool_calls: List[Dict[str, Any]] = []
+
+
+class Chunk(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str
+    hash: str
+    metadata: Dict[str, Any]
+
+class ChunkHit(BaseModel):
+    chunk_id: str
+    doc_id: str
+    text: str
+    score: float
+    metadata: Dict[str, Any]
+
