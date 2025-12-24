@@ -1,0 +1,106 @@
+services:
+  api:
+    build: .
+    env_file:
+      - .env
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-monc_rag}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-mpnet-base-v2}
+      EMBED_CACHE_PATH: ${EMBED_CACHE_PATH:-./embed_cache.sqlite}
+      RAG_TOP_K: ${RAG_TOP_K:-8}
+      RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.25}
+
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./:/app
+    depends_on:
+      - ollama
+      - ollama-init
+      - qdrant
+
+  ollama:
+    image: ollama/ollama:0.13.4
+    ports:
+      - "11433:11434"
+    volumes:
+      - ollama:/root/.ollama
+    restart: unless-stopped
+
+  ollama-init:
+    image: ollama/ollama:0.13.4
+    depends_on:
+      - ollama
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+    volumes:
+      - ollama:/root/.ollama
+    entrypoint:
+      - sh
+      - -lc
+      - |
+        set -e
+        echo "Waiting for Ollama..."
+        i=0
+        until ollama list >/dev/null 2>&1; do
+          i=$$((i+1))
+          if [ "$$i" -gt 60 ]; then
+            echo "Ollama not responding in time" >&2
+            exit 1
+          fi
+          sleep 1
+        done
+        echo "Pulling model: $OLLAMA_MODEL"
+        ollama pull "$OLLAMA_MODEL"
+        echo "Done."
+    restart: "no"
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.6
+    ports:
+      - "6334:6333"
+    volumes:
+      - qdrant:/qdrant/storage
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: mcp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg:/var/lib/postgresql/data
+
+  ui:
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      API_URL: http://api:8000
+    command: sh -lc "pip install -r requirements.txt && streamlit run app/ui/streamlit_app.py --server.address 0.0.0.0 --server.port 8501"
+    ports:
+      - "8501:8501"
+    depends_on:
+      - api
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate --url http://ui:8501
+    depends_on:
+      - ui
+    restart: unless-stopped
+
+volumes:
+  ollama:
+  pg:
+  qdrant:
