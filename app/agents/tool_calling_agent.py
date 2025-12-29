@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.logging_db import DbLogger
@@ -72,6 +73,58 @@ class ToolCallingAgent:
             parts.append(f"TOOL RESULTS (step {step}):\n{json.dumps(results_block, ensure_ascii=False)}\n")
         return "\n".join(parts)
 
+    @staticmethod
+    def _looks_like_retrieval_claim(s: str) -> bool:
+        """
+
+        :param s:
+        :return:
+        """
+
+        s = (s or "").lower()
+        patterns = [
+            r"\bdoc_id\b",
+            r"\bchunk_id\b",
+            r"\bsource_type\b",
+            r"\bmetadata\b",
+            r"\bscore\b",
+            r"\bhits\b",
+            r"\bretriev",
+            r"\bqdrant\b",
+            r"\bvector\b"
+        ]
+        return any(re.search(p, s) for p in patterns)
+
+
+    @staticmethod
+    def _no_retrieval_response() -> str:
+        return "NO_RETRIEVAL"
+
+
+    @staticmethod
+    def _contains_retrieval_artifacts(obj: Any) -> bool:
+        """
+        True if obj (dict/list) contains keys that look like retrieval evidence.
+        Works even when the model returns a dict (not just a string).
+        """
+        if isinstance(obj, dict):
+            # direct keys
+            keys = {str(k).lower() for k in obj.keys()}
+            banned = {"doc_id", "chunk_id", "score", "metadata", "source_type", "hits"}
+            if keys & banned:
+                return True
+            # nested
+            return any(ToolCallingAgent._contains_retrieval_artifacts(v) for v in obj.values())
+
+        if isinstance(obj, list):
+            return any(ToolCallingAgent._contains_retrieval_artifacts(x) for x in obj)
+
+        if isinstance(obj, str):
+            # fallback for strings
+            return ToolCallingAgent._looks_like_retrieval_claim(obj)
+
+        return False
+
     def run(
             self,
             message: str,
@@ -84,7 +137,12 @@ class ToolCallingAgent:
 
         tools_desc = json.dumps(self.registry.list(), ensure_ascii=False)
         agent_key = (agent_name or "default").lower().strip()
-        tools_allowed = agent_key in {"default"}  # only default agent can use tools
+        TOOLS_ENABLED_AGENT = {
+            "default",
+            "fastfinance",
+            "sme_business"
+        }
+        tools_allowed = agent_key in TOOLS_ENABLED_AGENT  # only default agent can use tools
         include_tools = tools_allowed
         prompt = self._build_prompt(include_tools=include_tools, tools_desc=tools_desc, message=message)
 
@@ -107,10 +165,22 @@ class ToolCallingAgent:
 
             msg_type = parsed.get("type")
 
-            if msg_type == "final":
-                out_raw = parsed.get("output", "")
+            if msg_type not in {"final", "tool_call"}:
+                out_raw = parsed.get("output", parsed)
                 out = self._normalize_final_output(out_raw, tool_calls)
-                self.db.log_event("final", {"output": out}, run_id=run_id, agent_name=agent_name)
+                if not tool_calls and (
+                    self._contains_retrieval_artifacts(out_raw) or self._contains_retrieval_artifacts(out)
+                ):
+                    blocked = self._no_retrieval_response()
+                    self.db.log_event(
+                        "final_blocked_fake_sources",
+                        {"raw": out_raw, "normalized": out, "output": blocked},
+                        run_id=run_id,
+                        agent_name=agent_name,
+                    )
+                    return run_id, blocked, tool_calls
+
+                self.db.log_event("final_unknown_type_coerced", {"output": out, "parsed" : parsed}, run_id=run_id, agent_name=agent_name)
                 return run_id, out, tool_calls
 
                 # If this agent forbids tools and the model tries to call one,
@@ -182,6 +252,19 @@ class ToolCallingAgent:
 
                 name = c.get("name")
                 args = c.get("args") or {}
+
+                if name == "rag_search":
+                    args = dict(args or {})
+                    args["query"] = message
+
+                    if "top_k" not in args or not args["top_k"]:
+                        args["top_k"] = 10
+
+                    agent_key = (agent_name or "default").lower().strip()
+                    if agent_key in {"fastfinance", "fast_finance"}:
+                        args.setdefault("brand", "Fast Finance")
+                        args.setdefault("country", "GLOBAL")
+
 
                 if not isinstance(name, str) or not name:
                     self.db.log_event(
