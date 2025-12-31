@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import logging
+import time
 from typing import Optional
 
 import uvicorn
@@ -27,6 +28,19 @@ from app.tools import builtin_tools
 
 
 def create_app() -> FastAPI:
+    """
+    Create and configure FastAPI app.
+
+    Sets up:
+    - CORS middleware
+    - Optional Postgres-backend Dblogger
+    - Qdrant and local embedder for RAG search
+    - tool registry and MCP routes
+    - /chat endpoint backend by ToolCallingAgent
+    - /events debug endpoint
+
+    :return: Configured FastAPI app
+    """
     app = FastAPI(title=settings.app_name)
 
     app.add_middleware(
@@ -36,7 +50,36 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    db = DbLogger(settings.database_url)
+    REQUIRE_DB = os.getenv("REQUIRE_DB", "false").lower() == "true"
+    DB_INIT_RETRIES = int(os.getenv("DB_INIT_RETRIES", "30"))
+    DB_INIT_SLEEP_S = float(os.getenv("DB_INIT_SLEEP_S", "1.0"))
+
+    db: Optional[DbLogger] = None
+    last_db_err: Optional[Exception] = None
+
+    for i in range(DB_INIT_RETRIES):
+        try:
+            db = DbLogger(settings.database_url)
+            last_db_err = None
+            break
+        except Exception as e:
+            last_db_err = e
+            logging.exception(
+                f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}"
+            )
+            time.sleep(DB_INIT_SLEEP_S)
+
+    if db is None:
+        if REQUIRE_DB:
+            raise last_db_err
+        logging.error("Continuing without DbLogger (events endpoint will be degraded).")
+
+    def safe_log_event(event_type: str, payload: dict, *, run_id: Optional[str], agent_name: str) -> None:
+        try:
+            if db is not None:
+                db.log_event(event_type, payload, run_id=run_id, agent_name=agent_name)
+        except Exception as e:
+            logging.exception(f"DbLogger failure (ignored): {e}")
 
     rag_store = QdrantRagStore()
     rag_embedder = LocalEmbedder()
@@ -51,10 +94,6 @@ def create_app() -> FastAPI:
             raise
 
     def safe_rag_search(query: str, top_k: Optional[int] = None):
-        """
-        Degrade gracefully when Qdrant is unavailable.
-        Returning [] means 'no grounded context found/available' rather than failing /chat.
-        """
         try:
             return rag_store.search(
                 rag_embedder.embed_query(query),
@@ -140,29 +179,39 @@ def create_app() -> FastAPI:
 
     @app.post("/chat", response_model=ChatResponse, tags=["chat"])
     def chat(req: ChatRequest) -> ChatResponse:
+        """
+        Run the tool-calling agent on user message.
+
+        :param req: Chat request
+        :return: ChatResponse including output text and tool call trace
+        :raises HTTPException: 500 on unhandled errors
+        """
+        agent_name = req.agent_name or "default"
         try:
             run_id, output, tool_calls = agent.run(
                 req.message,
                 run_id=req.run_id,
-                agent_name=req.agent_name or "default",
+                agent_name=agent_name,
             )
             return ChatResponse(
                 run_id=run_id,
-                agent_name=req.agent_name or "default",
+                agent_name=agent_name,
                 output=output,
                 tool_calls=tool_calls,
             )
         except Exception as e:
-            db.log_event(
+            safe_log_event(
                 "chat_error",
                 {"error": str(e)},
                 run_id=req.run_id,
-                agent_name=req.agent_name or "default",
+                agent_name=agent_name,
             )
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/events", tags=["debug"])
     def events(limit: int = 50, run_id: Optional[str] = None):
+        if db is None:
+            return {"ok": False, "error": "DbLogger not initialized", "events": []}
         return db.recent_events(limit=limit, run_id=run_id)
 
     return app

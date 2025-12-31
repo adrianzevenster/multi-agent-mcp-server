@@ -15,14 +15,18 @@ services:
       RAG_TOP_K: ${RAG_TOP_K:-8}
       RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.25}
 
+      REQUIRE_DB: "false"
+      REQUIRE_QDRANT: "false"
     ports:
       - "8000:8000"
     volumes:
       - ./:/app
+    restart: unless-stopped
     depends_on:
+      - postgres
+      - qdrant
       - ollama
       - ollama-init
-      - qdrant
 
   ollama:
     image: ollama/ollama:0.13.4
@@ -50,14 +54,14 @@ services:
         i=0
         until ollama list >/dev/null 2>&1; do
           i=$$((i+1))
-          if [ "$$i" -gt 60 ]; then
+          if [ "$$i" -gt 300 ]; then
             echo "Ollama not responding in time" >&2
             exit 1
           fi
           sleep 1
         done
-        echo "Pulling model: $OLLAMA_MODEL"
-        ollama pull "$OLLAMA_MODEL"
+        echo "Pulling model: $$OLLAMA_MODEL"
+        ollama pull "$$OLLAMA_MODEL"
         echo "Done."
     restart: "no"
 
@@ -79,6 +83,12 @@ services:
       - "5432:5432"
     volumes:
       - pg:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mcp"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
 
   ui:
     image: python:3.11-slim
