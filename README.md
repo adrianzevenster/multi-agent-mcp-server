@@ -1,7 +1,7 @@
 
-# Vector this Son
+# Multi Agent RAG MCP
 
-Vector this Son is a **local-first agent + RAG stack** built around:
+Multi Agent RAG MCP is a **local-first agent + RAG stack** built around:
 
 - **Ollama** for running LLMs locally
 - **Qdrant** as the vector database for retrieval
@@ -123,7 +123,7 @@ OLLAMA_MODEL=llama3.1
 
 # Qdrant
 QDRANT_URL=http://localhost:6333
-QDRANT_COLLECTION=vector-this-son
+QDRANT_COLLECTION=Multi Agent RAG MCP
 
 # Retrieval
 TOP_K=8
