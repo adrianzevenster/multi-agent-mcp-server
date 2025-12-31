@@ -347,6 +347,7 @@ class ToolCallingAgent:
         if not text:
             return None
 
+  
         if not text.startswith("{"):
             start = text.find("{")
             end = text.rfind("}")
@@ -369,6 +370,7 @@ class ToolCallingAgent:
 
         if isinstance(out_raw, list):
             return json.dumps(out_raw, ensure_ascii=False)
+
 
         s = str(out_raw).strip()
         if not s:
