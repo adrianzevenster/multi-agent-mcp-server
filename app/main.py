@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import logging
 import time
-from typing import Optional
+import re
+from typing import Optional, Dict, Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -28,19 +29,6 @@ from app.tools import builtin_tools
 
 
 def create_app() -> FastAPI:
-    """
-    Create and configure FastAPI app.
-
-    Sets up:
-    - CORS middleware
-    - Optional Postgres-backend Dblogger
-    - Qdrant and local embedder for RAG search
-    - tool registry and MCP routes
-    - /chat endpoint backend by ToolCallingAgent
-    - /events debug endpoint
-
-    :return: Configured FastAPI app
-    """
     app = FastAPI(title=settings.app_name)
 
     app.add_middleware(
@@ -50,6 +38,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ------------------------------------------------------------
+    # DB logger: resilient to cold starts
+    # ------------------------------------------------------------
     REQUIRE_DB = os.getenv("REQUIRE_DB", "false").lower() == "true"
     DB_INIT_RETRIES = int(os.getenv("DB_INIT_RETRIES", "30"))
     DB_INIT_SLEEP_S = float(os.getenv("DB_INIT_SLEEP_S", "1.0"))
@@ -64,9 +55,7 @@ def create_app() -> FastAPI:
             break
         except Exception as e:
             last_db_err = e
-            logging.exception(
-                f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}"
-            )
+            logging.exception(f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}")
             time.sleep(DB_INIT_SLEEP_S)
 
     if db is None:
@@ -81,6 +70,9 @@ def create_app() -> FastAPI:
         except Exception as e:
             logging.exception(f"DbLogger failure (ignored): {e}")
 
+    # ------------------------------------------------------------
+    # RAG
+    # ------------------------------------------------------------
     rag_store = QdrantRagStore()
     rag_embedder = LocalEmbedder()
 
@@ -93,16 +85,55 @@ def create_app() -> FastAPI:
         if REQUIRE_QDRANT:
             raise
 
-    def safe_rag_search(query: str, top_k: Optional[int] = None):
+    def _normalize_rag_query(q: str) -> str:
+        """
+        Tool-calling prompts embed badly ("Use rag_search...").
+        Strip instruction scaffolding so retrieval hits the product facts.
+        """
+        q = (q or "").strip()
+
+        # remove obvious tool-instruction patterns
+        q = re.sub(r"(?i)\buse\s+rag_search\b.*?\bthen\s+answer:\s*", "", q).strip()
+        q = re.sub(r"(?i)\breturn\s+retrieved\s+hits\s+only\b", "", q).strip()
+        q = re.sub(r"(?i)\busing\s+retrieved\s+context\s+only:\s*", "", q).strip()
+
+        # if query is still super generic, add anchoring keywords
+        if len(q) < 12:
+            q = f"Fast Finance SME Credit Line {q}".strip()
+
+        # always anchor Fast Finance when mentioned anywhere
+        if re.search(r"(?i)\bfast\s*finance\b", q) and "SME Credit Line" not in q:
+            q = q + " SME Credit Line"
+
+        return q
+
+    def safe_rag_search(query: str, top_k: Optional[int] = None, brand: Optional[str] = None, country: Optional[str] = None):
+        """
+        Degrade gracefully when Qdrant is unavailable.
+        Returning [] means 'no grounded context found/available'.
+        """
+        q2 = _normalize_rag_query(query)
+
+        filters: Dict[str, Any] = {}
+        # only apply filters if provided; keep backward compatible
+        if brand:
+            filters["brand"] = brand
+        if country:
+            filters["country"] = country
+
         try:
             return rag_store.search(
-                rag_embedder.embed_query(query),
-                filters={},
+                rag_embedder.embed_query(q2),
+                filters=filters,
                 top_k=int(top_k or settings.RAG_TOP_K),
             )
-        except Exception:
+        except Exception as e:
+            logging.exception(f"RAG search failed (ignored): {e}")
             return []
 
+    # ------------------------------------------------------------
+    # Tools
+    # ------------------------------------------------------------
     tools = [
         Tool(
             name="ping",
@@ -140,10 +171,12 @@ def create_app() -> FastAPI:
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer"},
+                    "brand": {"type": "string"},
+                    "country": {"type": "string"},
                 },
                 "required": ["query"],
             },
-            fn=lambda query, top_k=None: safe_rag_search(query, top_k),
+            fn=lambda query, top_k=None, brand=None, country=None: safe_rag_search(query, top_k, brand=brand, country=country),
         ),
     ]
 
@@ -179,13 +212,6 @@ def create_app() -> FastAPI:
 
     @app.post("/chat", response_model=ChatResponse, tags=["chat"])
     def chat(req: ChatRequest) -> ChatResponse:
-        """
-        Run the tool-calling agent on user message.
-
-        :param req: Chat request
-        :return: ChatResponse including output text and tool call trace
-        :raises HTTPException: 500 on unhandled errors
-        """
         agent_name = req.agent_name or "default"
         try:
             run_id, output, tool_calls = agent.run(
@@ -200,12 +226,7 @@ def create_app() -> FastAPI:
                 tool_calls=tool_calls,
             )
         except Exception as e:
-            safe_log_event(
-                "chat_error",
-                {"error": str(e)},
-                run_id=req.run_id,
-                agent_name=agent_name,
-            )
+            safe_log_event("chat_error", {"error": str(e)}, run_id=req.run_id, agent_name=agent_name)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/events", tags=["debug"])
