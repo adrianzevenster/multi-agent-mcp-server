@@ -3,8 +3,7 @@ from __future__ import annotations
 import os
 import logging
 import time
-import re
-from typing import Optional, Dict, Any
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException
@@ -28,7 +27,21 @@ from app.agents.tool_calling_agent import ToolCallingAgent
 from app.tools import builtin_tools
 
 
+
 def create_app() -> FastAPI:
+    """
+    Create and configure FastAPI app.
+
+    Sets up:
+    - CORS middleware
+    - Optional Postgres-backend Dblogger
+    - Qdrant and local embedder for RAG search
+    - tool registry and MCP routes
+    - /chat endpoint backend by ToolCallingAgent
+    - /events debug endpoint
+
+    :return: Configured FastAPI app
+    """
     app = FastAPI(title=settings.app_name)
 
     app.add_middleware(
@@ -38,9 +51,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    # ------------------------------------------------------------
-    # DB logger: resilient to cold starts
-    # ------------------------------------------------------------
     REQUIRE_DB = os.getenv("REQUIRE_DB", "false").lower() == "true"
     DB_INIT_RETRIES = int(os.getenv("DB_INIT_RETRIES", "30"))
     DB_INIT_SLEEP_S = float(os.getenv("DB_INIT_SLEEP_S", "1.0"))
@@ -70,9 +80,6 @@ def create_app() -> FastAPI:
         except Exception as e:
             logging.exception(f"DbLogger failure (ignored): {e}")
 
-    # ------------------------------------------------------------
-    # RAG
-    # ------------------------------------------------------------
     rag_store = QdrantRagStore()
     rag_embedder = LocalEmbedder()
 
@@ -85,55 +92,25 @@ def create_app() -> FastAPI:
         if REQUIRE_QDRANT:
             raise
 
-    def _normalize_rag_query(q: str) -> str:
-        """
-        Tool-calling prompts embed badly ("Use rag_search...").
-        Strip instruction scaffolding so retrieval hits the product facts.
-        """
-        q = (q or "").strip()
-
-        # remove obvious tool-instruction patterns
-        q = re.sub(r"(?i)\buse\s+rag_search\b.*?\bthen\s+answer:\s*", "", q).strip()
-        q = re.sub(r"(?i)\breturn\s+retrieved\s+hits\s+only\b", "", q).strip()
-        q = re.sub(r"(?i)\busing\s+retrieved\s+context\s+only:\s*", "", q).strip()
-
-        # if query is still super generic, add anchoring keywords
-        if len(q) < 12:
-            q = f"Fast Finance SME Credit Line {q}".strip()
-
-        # always anchor Fast Finance when mentioned anywhere
-        if re.search(r"(?i)\bfast\s*finance\b", q) and "SME Credit Line" not in q:
-            q = q + " SME Credit Line"
-
-        return q
-
-    def safe_rag_search(query: str, top_k: Optional[int] = None, brand: Optional[str] = None, country: Optional[str] = None):
-        """
-        Degrade gracefully when Qdrant is unavailable.
-        Returning [] means 'no grounded context found/available'.
-        """
-        q2 = _normalize_rag_query(query)
-
-        filters: Dict[str, Any] = {}
-        # only apply filters if provided; keep backward compatible
-        if brand:
-            filters["brand"] = brand
-        if country:
-            filters["country"] = country
-
+    def safe_rag_search(
+            query: str,
+            top_k: Optional[int] = None,
+            brand: Optional[str] = None,
+            country: Optional[str] = None,
+            min_score: Optional[float] = None,
+    ):
         try:
+            vec = rag_embedder.embed_query(query)
             return rag_store.search(
-                rag_embedder.embed_query(q2),
-                filters=filters,
+                vec,
+                filters={"brand": brand, "country": country} if (brand or country) else {},
                 top_k=int(top_k or settings.RAG_TOP_K),
+                min_score=min_score if min_score is not None else float(os.getenv("RAG_MIN_SCORE", "0.25")),
             )
         except Exception as e:
-            logging.exception(f"RAG search failed (ignored): {e}")
+            logging.exception(f"RAG search failed (returning []): {e}")
             return []
 
-    # ------------------------------------------------------------
-    # Tools
-    # ------------------------------------------------------------
     tools = [
         Tool(
             name="ping",
@@ -173,10 +150,17 @@ def create_app() -> FastAPI:
                     "top_k": {"type": "integer"},
                     "brand": {"type": "string"},
                     "country": {"type": "string"},
+                    "min_score": {"type": "number"},
                 },
                 "required": ["query"],
             },
-            fn=lambda query, top_k=None, brand=None, country=None: safe_rag_search(query, top_k, brand=brand, country=country),
+            fn=lambda query, top_k=None, brand=None, country=None, min_score=None: safe_rag_search(
+                query=query,
+                top_k=top_k,
+                brand=brand,
+                country=country,
+                min_score=min_score,
+            ),
         ),
     ]
 
@@ -212,6 +196,13 @@ def create_app() -> FastAPI:
 
     @app.post("/chat", response_model=ChatResponse, tags=["chat"])
     def chat(req: ChatRequest) -> ChatResponse:
+        """
+        Run the tool-calling agent on user message.
+
+        :param req: Chat request
+        :return: ChatResponse including output text and tool call trace
+        :raises HTTPException: 500 on unhandled errors
+        """
         agent_name = req.agent_name or "default"
         try:
             run_id, output, tool_calls = agent.run(

@@ -15,18 +15,20 @@ services:
       RAG_TOP_K: ${RAG_TOP_K:-8}
       RAG_MIN_SCORE: ${RAG_MIN_SCORE:-0.25}
 
-      REQUIRE_DB: "false"
-      REQUIRE_QDRANT: "false"
+      REQUIRE_DB: ${REQUIRE_DB:-false}
+      DB_INIT_RETRIES: ${DB_INIT_RETRIES:-30}
+      DB_INIT_SLEEP_S: ${DB_INIT_SLEEP_S:-1.0}
+
     ports:
       - "8000:8000"
     volumes:
       - ./:/app
-    restart: unless-stopped
     depends_on:
-      - postgres
-      - qdrant
       - ollama
       - ollama-init
+      - qdrant
+      - postgres
+      - rag-seed
 
   ollama:
     image: ollama/ollama:0.13.4
@@ -54,14 +56,14 @@ services:
         i=0
         until ollama list >/dev/null 2>&1; do
           i=$$((i+1))
-          if [ "$$i" -gt 300 ]; then
+          if [ "$$i" -gt 60 ]; then
             echo "Ollama not responding in time" >&2
             exit 1
           fi
           sleep 1
         done
-        echo "Pulling model: $$OLLAMA_MODEL"
-        ollama pull "$$OLLAMA_MODEL"
+        echo "Pulling model: $OLLAMA_MODEL"
+        ollama pull "$OLLAMA_MODEL"
         echo "Done."
     restart: "no"
 
@@ -73,6 +75,23 @@ services:
       - qdrant:/qdrant/storage
     restart: unless-stopped
 
+  rag-seed:
+    build: .
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-monc_rag}
+      EMBED_DIM: ${EMBED_DIM:-768}
+      EMBED_MODEL: ${EMBED_MODEL:-sentence-transformers/all-mpnet-base-v2}
+      EMBED_CACHE_PATH: ${EMBED_CACHE_PATH:-./embed_cache.sqlite}
+    volumes:
+      - ./:/app
+    depends_on:
+      - qdrant
+    command: ["python", "-m", "app.rag.seed_fastfinance"]
+    restart: "no"
+
   postgres:
     image: postgres:16
     environment:
@@ -83,7 +102,6 @@ services:
       - "5432:5432"
     volumes:
       - pg:/var/lib/postgresql/data
-    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d mcp"]
       interval: 3s

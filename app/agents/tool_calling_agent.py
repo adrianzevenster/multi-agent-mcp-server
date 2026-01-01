@@ -14,6 +14,12 @@ from app.llm.openai_compat_client import OpenAICompatClient
 
 
 class ToolCallingAgent:
+    """
+    Minimal tool-calling loop:
+    - route user message to an Ollama
+    - optionally execute on tool call
+    - return a final string output + tool call trace
+    """
     def __init__(
             self,
             registry: ToolRegistry,
@@ -24,6 +30,16 @@ class ToolCallingAgent:
             openai_compat: Optional[OpenAICompatClient] = None,
             max_steps: int = 2,
     ):
+        """
+        Create the agent
+
+        :param registry: Toll registry used to list/call tools
+        :param db:  Optional DB logger for structured event logging
+        :param llm_provider: Which LLM backend to use: "ollama" or "openai_compat"
+        :param ollama: Ollama client
+        :param openai_compat: OpenAI-compatible client
+        :param max_steps: Maximum LLM/tool iterations before forcing final answer
+        """
         self.registry = registry
         self.db = db
         self.llm_provider = llm_provider
@@ -39,6 +55,15 @@ class ToolCallingAgent:
             pass
 
     def _llm(self, system: str, prompt: str) -> str:
+        """
+        Call configured LLM backend.
+
+        :param system: System prompt / instructions
+        :param prompt: User and context prompt
+        :return: Raw model output text
+        :raises RuntimeError: If configured provider client is missing
+        :raise ValueError: If llm_provider is unknown
+        """
         if self.llm_provider == "ollama":
             if not self.ollama:
                 raise RuntimeError("Ollama client not configured")
@@ -61,6 +86,16 @@ class ToolCallingAgent:
             step: int = 0,
             extra: Optional[str] = None,
     ) -> str:
+        """
+        Build the text prompt passed to the LLM.
+
+        :param include_tools: Whether to include tool descriptions
+        :param tools_desc: Tool metadata / description blob
+        :param message: User message text
+        :param results_block: Option tool execution results from previous steps
+        :param step: Step index
+        :return: Prompt string
+        """
         parts: List[str] = []
         if include_tools:
             parts.append(f"TOOLS:\n{tools_desc}\n")
@@ -114,7 +149,6 @@ class ToolCallingAgent:
         if not text:
             return None
 
-  
         if not text.startswith("{"):
             start = text.find("{")
             end = text.rfind("}")
@@ -140,7 +174,6 @@ class ToolCallingAgent:
 
         if isinstance(out_raw, list):
             return json.dumps(out_raw, ensure_ascii=False)
-
 
         s = str(out_raw).strip()
         if not s or s.lower() == "none":
@@ -174,6 +207,14 @@ class ToolCallingAgent:
             run_id: Optional[str],
             agent_name: str,
     ) -> Tuple[str, str, List[Dict[str, Any]]]:
+        """
+        Run the agent on a user message
+
+        :param message: User text message
+        :param run_id: Optional run id (generated if None)
+        :param agent_name: Agent name used for prompt and tool policy
+        :return: (run_id, final_output_text, tool_calls)
+        """
         run_id = run_id or str(uuid.uuid4())
         tool_calls: List[Dict[str, Any]] = []
 
