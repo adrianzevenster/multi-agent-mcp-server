@@ -27,6 +27,7 @@ from app.agents.tool_calling_agent import ToolCallingAgent
 from app.tools import builtin_tools
 
 
+
 def create_app() -> FastAPI:
     """
     Create and configure FastAPI app.
@@ -64,9 +65,7 @@ def create_app() -> FastAPI:
             break
         except Exception as e:
             last_db_err = e
-            logging.exception(
-                f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}"
-            )
+            logging.exception(f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}")
             time.sleep(DB_INIT_SLEEP_S)
 
     if db is None:
@@ -93,14 +92,23 @@ def create_app() -> FastAPI:
         if REQUIRE_QDRANT:
             raise
 
-    def safe_rag_search(query: str, top_k: Optional[int] = None):
+    def safe_rag_search(
+            query: str,
+            top_k: Optional[int] = None,
+            brand: Optional[str] = None,
+            country: Optional[str] = None,
+            min_score: Optional[float] = None,
+    ):
         try:
+            vec = rag_embedder.embed_query(query)
             return rag_store.search(
-                rag_embedder.embed_query(query),
-                filters={},
+                vec,
+                filters={"brand": brand, "country": country} if (brand or country) else {},
                 top_k=int(top_k or settings.RAG_TOP_K),
+                min_score=min_score if min_score is not None else float(os.getenv("RAG_MIN_SCORE", "0.25")),
             )
-        except Exception:
+        except Exception as e:
+            logging.exception(f"RAG search failed (returning []): {e}")
             return []
 
     tools = [
@@ -140,10 +148,19 @@ def create_app() -> FastAPI:
                 "properties": {
                     "query": {"type": "string"},
                     "top_k": {"type": "integer"},
+                    "brand": {"type": "string"},
+                    "country": {"type": "string"},
+                    "min_score": {"type": "number"},
                 },
                 "required": ["query"],
             },
-            fn=lambda query, top_k=None: safe_rag_search(query, top_k),
+            fn=lambda query, top_k=None, brand=None, country=None, min_score=None: safe_rag_search(
+                query=query,
+                top_k=top_k,
+                brand=brand,
+                country=country,
+                min_score=min_score,
+            ),
         ),
     ]
 
@@ -200,12 +217,7 @@ def create_app() -> FastAPI:
                 tool_calls=tool_calls,
             )
         except Exception as e:
-            safe_log_event(
-                "chat_error",
-                {"error": str(e)},
-                run_id=req.run_id,
-                agent_name=agent_name,
-            )
+            safe_log_event("chat_error", {"error": str(e)}, run_id=req.run_id, agent_name=agent_name)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/events", tags=["debug"])
