@@ -85,6 +85,36 @@ class ToolCallingAgent:
         return "NO_RETRIEVAL"
 
     @staticmethod
+    def _wants_no_retrieval_contract(message: str) -> bool:
+        m = (message or "").lower()
+        return ("no_retrieval" in m) and ("if not" in m or "if it is not" in m)
+
+    @staticmethod
+    def is_rates_fees_question(message: str) -> bool:
+        m = (message or "").lower()
+        keyword = ["interest", "rate", "apr", "fee", "fees", "pricing", "cost", "charge", "charges", "repayment"]
+        return any(k in m for k in keyword)
+
+    @staticmethod
+    def _has_rates_or_fees_in_hits(hits: List[Dict[str, Any]]) -> bool:
+        if not hits:
+            return False
+
+        blob = "\n".join([h.get("text", "") for h in hits]).lower()
+
+        strong_patterns = [
+            r"\bapr\b",
+            r"\binterest\b",
+            r"\brate(s)?\b",
+            r"\bfee(s)?\b",
+            r"%",
+            r"\bper\s+month\b",
+            r"\bper\s+annum\b",
+            r"\bp\.a\.\b",
+        ]
+        return any(re.search(p, blob) for p in strong_patterns)
+
+    @staticmethod
     def _contains_interest_or_fee_info(text: str) -> bool:
         t = (text or "").lower()
 
@@ -138,7 +168,6 @@ class ToolCallingAgent:
         if not s:
             return ""
 
-        # if it's valid json, keep it stable
         if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
             try:
                 obj = json.loads(s)
@@ -161,13 +190,51 @@ class ToolCallingAgent:
             end = text.rfind("}")
             if start == -1 or end == -1 or end <= start:
                 return None
-            text = text[start : end + 1]
+            text = text[start: end + 1]
 
         try:
             obj = json.loads(text)
             return obj if isinstance(obj, dict) else None
         except Exception:
             return None
+
+    @staticmethod
+    def _looks_like_type_less_final(parsed: Dict[str, Any]) -> bool:
+        if not isinstance(parsed, dict):
+            return False
+        if "type" in parsed:
+            return False
+        # Heuristic: common "final" payload shapes we've seen from the model
+        if "ads" in parsed and isinstance(parsed.get("ads"), list):
+            return True
+        if "output" in parsed:
+            return True
+        if all(k in parsed for k in ("brand", "product")):
+            return True
+        return False
+
+    @staticmethod
+    def _wants_ads(message: str) -> bool:
+        m = (message or "").lower()
+        if "ad" not in m and "ads" not in m:
+            return False
+        return any(k in m for k in ["create", "generate", "write", "make"])
+
+    @staticmethod
+    def _fastfinance_ads_valid(obj: Dict[str, Any]) -> bool:
+        try:
+            ads = obj.get("ads")
+            if not isinstance(ads, list) or len(ads) != 3:
+                return False
+            for a in ads:
+                if not isinstance(a, dict):
+                    return False
+                pt = (a.get("primary_text") or "")
+                if "T&Cs and eligibility apply." not in pt:
+                    return False
+            return True
+        except Exception:
+            return False
 
     def _force_finalize_safely(
             self,
@@ -222,6 +289,23 @@ class ToolCallingAgent:
 
         msg = (message or "").strip()
 
+        if self._wants_no_retrieval_contract(msg) and self.is_rates_fees_question(msg):
+            try:
+                hits = self.registry.call("rag_search", {"query": message, "top_k": 10})
+                tool_calls.append({"name": "rag_search", "args": {"query": message, "top_k": 10}, "result": hits})
+            except Exception:
+                hits = []
+
+            if not self._has_rates_or_fees_in_hits(hits):
+                out = self._no_retrieval_response()
+                try:
+                    if self.db is not None:
+                        self.db.log_event("final_no_retrieval_gate", {"output": out}, run_id=run_id,
+                                          agent_name=agent_name)
+                except Exception:
+                    pass
+                return run_id, out, tool_calls
+
         if msg.lower() == "ping":
             try:
                 result = self.registry.call("ping", {})
@@ -239,7 +323,9 @@ class ToolCallingAgent:
                 self._log("final_fastpath_ragtest_blocked", {"output": out}, run_id=run_id, agent_name=agent_name)
                 return run_id, out, tool_calls
 
-            args = {"query": msg, "top_k": 10}
+            rag_query = re.sub(r"(?i)^__rag_test__\s*", "", msg).strip() or msg
+
+            args = {"query": rag_query, "top_k": 10}
             try:
                 result = self.registry.call("rag_search", args)
                 tool_calls.append({"name": "rag_search", "args": args, "result": result})
@@ -249,6 +335,62 @@ class ToolCallingAgent:
             except Exception as e:
                 self._log("final_fastpath_ragtest_error", {"error": str(e)}, run_id=run_id, agent_name=agent_name)
                 return run_id, "I couldn't complete the request.", tool_calls
+
+        if agent_key in {"fastfinance", "fast_finance"} and tools_allowed and self._wants_ads(msg):
+            try:
+                hits = self.registry.call(
+                    "rag_search",
+                    {
+                        "query": "Fast Finance product facts and compliance rules",
+                        "top_k": 8,
+                        "brand": "Fast Finance",
+                        "country": "GLOBAL",
+                    },
+                )
+                tool_calls.append(
+                    {
+                        "name": "rag_search",
+                        "args": {
+                            "query": "Fast Finance product facts and compliance rules",
+                            "top_k": 8,
+                            "brand": "Fast Finance",
+                            "country": "GLOBAL",
+                        },
+                        "result": hits,
+                    }
+                )
+            except Exception:
+                hits = []
+
+            system = system_for_agent(agent_name)
+            results_block = [{"name": "rag_search", "ok": True, "result": hits}]
+            ff_prompt = self._build_prompt(
+                include_tools=False,
+                tools_desc=tools_desc,
+                message=msg,
+                results_block=results_block,
+                step=0,
+            )
+
+            raw = self._llm(system, ff_prompt)
+            self._log("llm_raw", {"step": 0, "raw": raw}, run_id=run_id, agent_name=agent_name)
+
+            parsed = self._safe_parse_json(raw)
+            if parsed:
+                if parsed.get("type") == "final":
+                    out_raw = parsed.get("output", "")
+                    out = self._normalize_final_output(out_raw)
+                    try:
+                        obj = json.loads(out) if isinstance(out, str) else out
+                        if isinstance(obj, dict) and self._fastfinance_ads_valid(obj):
+                            self._log("final_fastfinance_ads", {"output": out}, run_id=run_id, agent_name=agent_name)
+                            return run_id, out, tool_calls
+                    except Exception:
+                        pass
+
+            out = "I couldn't complete the request."
+            self._log("final_fastfinance_ads_fallback", {"output": out}, run_id=run_id, agent_name=agent_name)
+            return run_id, out, tool_calls
 
         self._log("user_message", {"message": message}, run_id=run_id, agent_name=agent_name)
 
@@ -265,6 +407,11 @@ class ToolCallingAgent:
                 self._log("final_fallback", {"output": out}, run_id=run_id, agent_name=agent_name)
                 return run_id, out, tool_calls
 
+            if self._looks_like_type_less_final(parsed):
+                out = self._normalize_final_output(parsed)
+                self._log("final_typeless_json", {"output": out}, run_id=run_id, agent_name=agent_name)
+                return run_id, out, tool_calls
+
             msg_type = parsed.get("type")
 
             if msg_type == "tool_call":
@@ -277,14 +424,18 @@ class ToolCallingAgent:
                     continue
 
                 if step > 0:
-                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls, last_results_block=last_results_block)
-                    self._log("final_forced", {"output": out, "reason": "tool_call_after_results"}, run_id=run_id, agent_name=agent_name)
+                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls,
+                                                      last_results_block=last_results_block)
+                    self._log("final_forced", {"output": out, "reason": "tool_call_after_results"}, run_id=run_id,
+                              agent_name=agent_name)
                     return run_id, out, tool_calls
 
                 calls = parsed.get("calls") or []
                 if not isinstance(calls, list) or not calls or not isinstance(calls[0], dict):
-                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls, last_results_block=last_results_block)
-                    self._log("final_forced", {"output": out, "reason": "invalid_calls"}, run_id=run_id, agent_name=agent_name)
+                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls,
+                                                      last_results_block=last_results_block)
+                    self._log("final_forced", {"output": out, "reason": "invalid_calls"}, run_id=run_id,
+                              agent_name=agent_name)
                     return run_id, out, tool_calls
 
                 c = calls[0]
@@ -323,8 +474,10 @@ class ToolCallingAgent:
                             args["country"] = "GLOBAL"
 
                 if not isinstance(name, str) or not name:
-                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls, last_results_block=last_results_block)
-                    self._log("tool_error", {"name": str(name), "error": "invalid tool name"}, run_id=run_id, agent_name=agent_name)
+                    out = self._force_finalize_safely(message=message, tool_calls=tool_calls,
+                                                      last_results_block=last_results_block)
+                    self._log("tool_error", {"name": str(name), "error": "invalid tool name"}, run_id=run_id,
+                              agent_name=agent_name)
                     return run_id, out, tool_calls
 
                 self._log("tool_call", {"name": name, "args": args}, run_id=run_id, agent_name=agent_name)
