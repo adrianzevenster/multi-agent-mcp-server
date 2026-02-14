@@ -23,7 +23,7 @@ class OllamaClient:
             "format": "json",
         }
 
-        r = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=180)
+        r = requests.post(f"{self.base_url}/api/chat", json=payload, timeout=600)
 
         if r.status_code == 404:
             raise RuntimeError(
