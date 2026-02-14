@@ -10,4 +10,6 @@ RUN pip install --no-cache-dir -r /app/requirements.api.txt
 
 COPY . /app
 
-CMD ["sh", "-c", "uvicorn app.mcp.mcp_http_api:app --host 0.0.0.0 --port ${PORT}"]
+ENV PORT=8000
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+

@@ -6,7 +6,7 @@ import time
 import urllib.request
 import urllib.error
 from typing import Any, Dict, List, Optional
-
+from app.core.config import settings
 
 class QdrantRagStore:
     """
@@ -25,8 +25,8 @@ class QdrantRagStore:
     """
 
     def __init__(self):
-        self.qdrant_url = os.getenv("QDRANT_URL", "http://qdrant:6333").rstrip("/")
-        self.collection = os.getenv("QDRANT_COLLECTION", "monc_rag")
+        self.qdrant_url = settings.qdrant_url.rstrip("/")
+        self.collection = settings.qdrant_collection
         self.embed_dim = int(os.getenv("EMBED_DIM", "768"))
 
     def _http_json(

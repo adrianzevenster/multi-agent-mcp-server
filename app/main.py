@@ -1,20 +1,16 @@
-from __future__ import annotations
-
-import os
+import inspect
 import logging
+import os
 import time
-from typing import Optional
+from typing import Optional, Any, List
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.rag.embedder import LocalEmbedder
-from app.rag.qdrant_store import QdrantRagStore
-
 from app.core.config import settings
+from app.core.logging_db import DbLogger, QdrantEventLogger
 from app.core.models import ChatRequest, ChatResponse
-from app.core.logging_db import DbLogger
 
 from app.llm.ollama_client import OllamaClient
 from app.llm.openai_compat_client import OpenAICompatClient
@@ -23,25 +19,135 @@ from app.mcp.tool_types import Tool
 from app.mcp.tool_registry import ToolRegistry
 from app.mcp.mcp_http import mount_mcp_routes
 
-from app.agents.tool_calling_agent import ToolCallingAgent
-from app.tools import builtin_tools
+from app.rag.embedder import LocalEmbedder
+from app.rag.qdrant_store import QdrantRagStore
 
+from app.tools import builtin_tools
+from app.agents.tool_calling_agent import ToolCallingAgent
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _init_db_logger() -> Optional[DbLogger]:
+    """
+    Optional DB logger init with retry. Non-fatal unless REQUIRE_DB=true.
+    """
+    require_db = _bool_env("REQUIRE_DB", False)
+    retries = int(os.getenv("DB_INIT_RETRIES", "30"))
+    sleep_s = float(os.getenv("DB_INIT_SLEEP_S", "1.0"))
+
+    last_err: Optional[Exception] = None
+    for i in range(retries):
+        try:
+            db = DbLogger(settings.database_url)
+            logging.info("DbLogger enabled")
+            return db
+        except Exception as e:
+            last_err = e
+            logging.getLogger(__name__).warning(
+                "Postgres unavailable during startup (attempt %s/%s): %r",
+                i + 1,
+                retries,
+                e,
+                )
+            time.sleep(sleep_s)
+
+    if require_db and last_err is not None:
+        raise last_err
+
+    logging.getLogger(__name__).warning("DbLogger disabled (postgres not reachable)")
+    return None
+
+
+def _build_qdrant_event_logger(
+        *,
+        qdrant_url: str,
+        collection: str,
+        embed_dim: int,
+        autocreate: bool,
+) -> Optional[QdrantEventLogger]:
+    """
+    Create QdrantEventLogger while tolerating signature drift.
+    Your runtime indicated embed_dim is required, so we map it properly.
+    """
+    if not qdrant_url:
+        return None
+
+    try:
+        sig = inspect.signature(QdrantEventLogger.__init__)
+        params = set(sig.parameters.keys())
+
+        kwargs: dict[str, Any] = {}
+
+        # URL param variants
+        if "url" in params:
+            kwargs["url"] = qdrant_url
+        elif "host" in params:
+            kwargs["host"] = qdrant_url
+        elif "endpoint" in params:
+            kwargs["endpoint"] = qdrant_url
+        elif "qdrant_url" in params:
+            kwargs["qdrant_url"] = qdrant_url
+        else:
+            logging.getLogger(__name__).warning(
+                "QdrantEventLogger has no recognizable url param. params=%s", sorted(params)
+            )
+            return None
+
+        # collection param variants
+        if "collection" in params:
+            kwargs["collection"] = collection
+        elif "collection_name" in params:
+            kwargs["collection_name"] = collection
+
+        # embed dim param variants (yours requires embed_dim)
+        if "embed_dim" in params:
+            kwargs["embed_dim"] = embed_dim
+        elif "dim" in params:
+            kwargs["dim"] = embed_dim
+        elif "vector_size" in params:
+            kwargs["vector_size"] = embed_dim
+        elif "embedding_dim" in params:
+            kwargs["embedding_dim"] = embed_dim
+
+        # autocreate param variants
+        if "autocreate" in params:
+            kwargs["autocreate"] = autocreate
+        elif "auto_create" in params:
+            kwargs["auto_create"] = autocreate
+        elif "create_if_missing" in params:
+            kwargs["create_if_missing"] = autocreate
+
+        ql = QdrantEventLogger(**kwargs)  # type: ignore[arg-type]
+        logging.info(
+            "Qdrant event logging enabled -> %s / %s (embed_dim=%s, autocreate=%s)",
+            qdrant_url,
+            collection,
+            embed_dim,
+            autocreate,
+        )
+        return ql
+
+    except Exception as e:
+        logging.getLogger(__name__).warning("QdrantEventLogger failed (ignored): %r", e)
+        return None
 
 
 def create_app() -> FastAPI:
-    """
-    Create and configure FastAPI app.
+    logging.basicConfig(level=getattr(logging, settings.log_level.upper(), logging.INFO))
+    log = logging.getLogger(__name__)
 
-    Sets up:
-    - CORS middleware
-    - Optional Postgres-backend Dblogger
-    - Qdrant and local embedder for RAG search
-    - tool registry and MCP routes
-    - /chat endpoint backend by ToolCallingAgent
-    - /events debug endpoint
+    log.info("ENV OLLAMA_BASE_URL=%s", os.getenv("OLLAMA_BASE_URL"))
+    log.info("ENV QDRANT_URL=%s", os.getenv("QDRANT_URL"))
+    log.info("ENV LOG_EVENTS_TO_QDRANT=%s", os.getenv("LOG_EVENTS_TO_QDRANT"))
+    log.info("ENV QDRANT_EVENT_COLLECTION=%s", os.getenv("QDRANT_EVENT_COLLECTION"))
+    log.info("ENV EMBED_DIM=%s", os.getenv("EMBED_DIM"))
 
-    :return: Configured FastAPI app
-    """
     app = FastAPI(title=settings.app_name)
 
     app.add_middleware(
@@ -51,46 +157,74 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    REQUIRE_DB = os.getenv("REQUIRE_DB", "false").lower() == "true"
-    DB_INIT_RETRIES = int(os.getenv("DB_INIT_RETRIES", "30"))
-    DB_INIT_SLEEP_S = float(os.getenv("DB_INIT_SLEEP_S", "1.0"))
+    # ----------------------------
+    # DB logger (optional)
+    # ----------------------------
+    db = _init_db_logger()
+    app.state.db = db
 
-    db: Optional[DbLogger] = None
-    last_db_err: Optional[Exception] = None
+    # ----------------------------
+    # Qdrant event logger (optional)
+    # ----------------------------
+    app.state.qdrant_event_logger = None
+    if _bool_env("LOG_EVENTS_TO_QDRANT", False):
+        qdrant_url = os.getenv("QDRANT_URL", "").strip()
+        collection = os.getenv("QDRANT_EVENT_COLLECTION", "monc_chat_logs").strip()
+        embed_dim = int(os.getenv("EMBED_DIM", "768"))
+        autocreate = _bool_env("QDRANT_EVENT_AUTOCREATE", True)
 
-    for i in range(DB_INIT_RETRIES):
-        try:
-            db = DbLogger(settings.database_url)
-            last_db_err = None
-            break
-        except Exception as e:
-            last_db_err = e
-            logging.exception(f"Postgres unavailable during startup (attempt {i + 1}/{DB_INIT_RETRIES}): {e}")
-            time.sleep(DB_INIT_SLEEP_S)
-
-    if db is None:
-        if REQUIRE_DB:
-            raise last_db_err
-        logging.error("Continuing without DbLogger (events endpoint will be degraded).")
+        app.state.qdrant_event_logger = _build_qdrant_event_logger(
+            qdrant_url=qdrant_url,
+            collection=collection,
+            embed_dim=embed_dim,
+            autocreate=autocreate,
+        )
 
     def safe_log_event(event_type: str, payload: dict, *, run_id: Optional[str], agent_name: str) -> None:
+        # Postgres
         try:
-            if db is not None:
-                db.log_event(event_type, payload, run_id=run_id, agent_name=agent_name)
+            if app.state.db is not None:
+                app.state.db.log_event(event_type, payload, run_id=run_id, agent_name=agent_name)
+        except Exception:
+            log.exception("DbLogger failure (ignored)")
+
+        # Qdrant
+        try:
+            ql: Optional[QdrantEventLogger] = getattr(app.state, "qdrant_event_logger", None)
+            if ql is not None:
+                ql.log_event(event_type, payload, run_id=run_id, agent_name=agent_name)
         except Exception as e:
-            logging.exception(f"DbLogger failure (ignored): {e}")
+            log.warning("QdrantEventLogger failed (ignored): %r", e)
 
-    rag_store = QdrantRagStore()
-    rag_embedder = LocalEmbedder()
+    app.state.safe_log_event = safe_log_event
 
-    REQUIRE_QDRANT = os.getenv("REQUIRE_QDRANT", "false").lower() == "true"
+    # ----------------------------
+    # RAG / Qdrant store (optional)
+    # ----------------------------
+    require_qdrant = _bool_env("REQUIRE_QDRANT", False)
+    rag_enabled = _bool_env("RAG_ENABLED", True)
+    rag_min_score = float(os.getenv("RAG_MIN_SCORE", "0.25"))
 
-    try:
-        rag_store.ensure_collection()
-    except Exception as e:
-        logging.exception(f"Qdrant unavailable during startup: {e}")
-        if REQUIRE_QDRANT:
-            raise
+    app.state.rag_enabled = bool(rag_enabled)
+    app.state.rag_ready = False
+    app.state.rag_last_error = None
+
+    # IMPORTANT: use repo’s constructors (no unexpected kwargs)
+    app.state.rag_store = QdrantRagStore()
+    app.state.rag_embedder = LocalEmbedder()
+
+    if app.state.rag_enabled:
+        try:
+            app.state.rag_store.ensure_collection()
+            app.state.rag_ready = True
+            app.state.rag_last_error = None
+            log.info("Qdrant ready. RAG enabled.")
+        except Exception as e:
+            app.state.rag_ready = False
+            app.state.rag_last_error = str(e)
+            log.exception("Qdrant unavailable during startup; continuing without RAG: %r", e)
+            if require_qdrant:
+                raise
 
     def safe_rag_search(
             query: str,
@@ -99,19 +233,58 @@ def create_app() -> FastAPI:
             country: Optional[str] = None,
             min_score: Optional[float] = None,
     ):
-        try:
-            vec = rag_embedder.embed_query(query)
-            return rag_store.search(
-                vec,
-                filters={"brand": brand, "country": country} if (brand or country) else {},
-                top_k=int(top_k or settings.RAG_TOP_K),
-                min_score=min_score if min_score is not None else float(os.getenv("RAG_MIN_SCORE", "0.25")),
-            )
-        except Exception as e:
-            logging.exception(f"RAG search failed (returning []): {e}")
+        if not getattr(app.state, "rag_enabled", True):
+            return []
+        if not getattr(app.state, "rag_ready", False):
             return []
 
-    tools = [
+        def _clean(v: Optional[str]) -> Optional[str]:
+            if v is None:
+                return None
+            v = str(v).strip()
+            if not v:
+                return None
+            if v.lower() in {"global", "all", "any", "none", "null"}:
+                return None
+            return v
+
+        brand = _clean(brand)
+        country = _clean(country)
+
+        try:
+            vec = app.state.rag_embedder.embed_query(query)
+
+            filters = {}
+            if brand:
+                filters["brand"] = brand
+            if country:
+                filters["country"] = country
+
+            res = app.state.rag_store.search(
+                vec,
+                filters=filters,
+                top_k=int(top_k or settings.RAG_TOP_K),
+                min_score=min_score if min_score is not None else rag_min_score,
+            )
+
+            # fall back to unfiltered if filtered returns nothing
+            if not res and filters:
+                res = app.state.rag_store.search(
+                    vec,
+                    filters={},
+                    top_k=int(top_k or settings.RAG_TOP_K),
+                    min_score=min_score if min_score is not None else rag_min_score,
+                )
+            return res
+
+        except Exception:
+            log.exception("RAG search failed (returning [])")
+            return []
+
+    # ----------------------------
+    # Tools + registry
+    # ----------------------------
+    tools: List[Tool] = [
         Tool(
             name="ping",
             description="Health check tool; returns UTC timestamp",
@@ -136,7 +309,7 @@ def create_app() -> FastAPI:
         ),
         Tool(
             name="list_tools",
-            description="List available tools (hint: /mcp/tools shows full registry)",
+            description="List available tools",
             schema={"type": "object", "properties": {}, "required": []},
             fn=lambda: builtin_tools.list_tools(),
         ),
@@ -165,66 +338,100 @@ def create_app() -> FastAPI:
     ]
 
     registry = ToolRegistry(tools)
+    app.state.registry = registry
 
-    ollama = OllamaClient(settings.ollama_base_url, settings.ollama_model)
-    openai_compat = OpenAICompatClient(settings.openai_compat_base_url, settings.openai_compat_model)
+    # ✅ ensures /mcp/tools and /mcp/call exist
+    app.include_router(mount_mcp_routes(registry))
+
+    # ----------------------------
+    # LLM clients
+    # ----------------------------
+    ollama_base = os.getenv("OLLAMA_BASE_URL", settings.ollama_base_url)
+    ollama_model = os.getenv("OLLAMA_MODEL", settings.ollama_model)
+
+    openai_base = os.getenv("OPENAI_COMPAT_BASE_URL", settings.openai_compat_base_url)
+    openai_model = os.getenv("OPENAI_COMPAT_MODEL", settings.openai_compat_model)
+
+    ollama = OllamaClient(ollama_base, ollama_model)
+    openai_compat = OpenAICompatClient(openai_base, openai_model, os.getenv("OPENAI_COMPAT_API_KEY", ""))
+
+    llm_provider = os.getenv("LLM_PROVIDER", settings.llm_provider)
 
     agent = ToolCallingAgent(
         registry=registry,
         db=db,
-        llm_provider=settings.llm_provider,
+        llm_provider=llm_provider,
         ollama=ollama,
         openai_compat=openai_compat,
         max_steps=settings.max_tool_steps,
     )
+    app.state.agent = agent
 
-    app.include_router(mount_mcp_routes(registry))
-
+    # ----------------------------
+    # Meta / health
+    # ----------------------------
     @app.get("/", tags=["meta"])
-    def root():
+    def root(request: Request):
         return {
             "name": settings.app_name,
             "status": "ok",
             "docs": "/docs",
+            "rag": {
+                "enabled": bool(getattr(request.app.state, "rag_enabled", True)),
+                "ready": bool(getattr(request.app.state, "rag_ready", False)),
+                "last_error": getattr(request.app.state, "rag_last_error", None),
+            },
             "endpoints": {
                 "chat": "/chat",
                 "tools": "/mcp/tools",
                 "mcp_call": "/mcp/call",
                 "events": "/events",
+                "healthz": "/healthz",
+                "readyz": "/readyz",
             },
         }
 
-    @app.post("/chat", response_model=ChatResponse, tags=["chat"])
-    def chat(req: ChatRequest) -> ChatResponse:
-        """
-        Run the tool-calling agent on user message.
+    @app.get("/healthz", tags=["health"])
+    def healthz():
+        return {"ok": True}
 
-        :param req: Chat request
-        :return: ChatResponse including output text and tool call trace
-        :raises HTTPException: 500 on unhandled errors
-        """
+    @app.get("/readyz", tags=["health"])
+    def readyz(request: Request):
+        return {
+            "ok": True,
+            "agent_ready": bool(getattr(request.app.state, "agent", None) is not None),
+            "rag_ready": bool(getattr(request.app.state, "rag_ready", False)),
+            "db_ready": bool(getattr(request.app.state, "db", None) is not None),
+        }
+
+    # ----------------------------
+    # Chat + events
+    # ----------------------------
+    @app.post("/chat", response_model=ChatResponse, tags=["chat"])
+    def chat(req: ChatRequest, request: Request) -> ChatResponse:
         agent_name = req.agent_name or "default"
         try:
-            run_id, output, tool_calls = agent.run(
+            run_id, output, tool_calls = request.app.state.agent.run(
                 req.message,
                 run_id=req.run_id,
                 agent_name=agent_name,
             )
-            return ChatResponse(
-                run_id=run_id,
-                agent_name=agent_name,
-                output=output,
-                tool_calls=tool_calls,
-            )
+            return ChatResponse(run_id=run_id, agent_name=agent_name, output=output, tool_calls=tool_calls)
         except Exception as e:
-            safe_log_event("chat_error", {"error": str(e)}, run_id=req.run_id, agent_name=agent_name)
+            safe_log = getattr(request.app.state, "safe_log_event", None)
+            if callable(safe_log):
+                safe_log("chat_error", {"error": str(e)}, run_id=req.run_id, agent_name=agent_name)
             raise HTTPException(status_code=500, detail=str(e))
 
     @app.get("/events", tags=["debug"])
-    def events(limit: int = 50, run_id: Optional[str] = None):
-        if db is None:
-            return {"ok": False, "error": "DbLogger not initialized", "events": []}
-        return db.recent_events(limit=limit, run_id=run_id)
+    def events(request: Request, limit: int = 50, run_id: Optional[str] = None):
+        # Prefer DbLogger for /events (your UI expects list-like output)
+        db_: Optional[DbLogger] = getattr(request.app.state, "db", None)
+        if db_ is not None:
+            return db_.recent_events(limit=limit, run_id=run_id)
+
+        # Fallback if DB is not configured
+        return {"ok": False, "error": "DbLogger not initialized", "events": []}
 
     return app
 
